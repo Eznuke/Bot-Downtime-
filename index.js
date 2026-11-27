@@ -21,6 +21,9 @@ const DEFAULT_PREFIX = process.env.DEFAULT_PREFIX || '?';
 const DEBOUNCE_MS = Number(process.env.DEBOUNCE_MS || 5000);   // ignore very short flaps
 const SWEEP_MS = Number(process.env.SWEEP_MS || 30000);        // fallback re-check + reminders
 const PANEL_MS = Number(process.env.PANEL_MS || 60000);        // live panel refresh
+const REPORT_TZ_OFFSET = Number(process.env.REPORT_TZ_OFFSET ?? 7);       // hours from UTC for the daily report (7 = WIB)
+const HTTP_TIMEOUT_MS = Number(process.env.HTTP_TIMEOUT_MS || 8000);        // timeout for HTTP health checks
+const MAX_DM_USERS = 10;
 const MAX_BOTS = 25;
 const MAX_LOG = 500;
 const DATA_FILE = path.join(__dirname, 'data.json');
@@ -52,6 +55,9 @@ function g(guildId) {
   if (cfg.panel === undefined) cfg.panel = null;
   if (cfg.prefix === undefined) cfg.prefix = null;
   if (cfg.reminderMin === undefined) cfg.reminderMin = 0;
+  if (!Array.isArray(cfg.dmUsers)) cfg.dmUsers = [];
+  if (cfg.reportHour === undefined) cfg.reportHour = null;
+  if (cfg.lastReportDay === undefined) cfg.lastReportDay = null;
   return cfg;
 }
 const prefixOf = (guildId) => (db.guilds[guildId] && db.guilds[guildId].prefix) || DEFAULT_PREFIX;
@@ -77,6 +83,24 @@ function fmtDuration(ms) {
 const ts = (ms) => `<t:${Math.floor(ms / 1000)}:F> (<t:${Math.floor(ms / 1000)}:R>)`;
 const rel = (ms) => `<t:${Math.floor(ms / 1000)}:R>`;
 const icon = (s) => (s === 'online' ? '🟢' : s === 'offline' ? '🔴' : '⚪');
+
+// Presence + optional HTTP health check combine into one effective state:
+// a bot with a health URL counts as online only if presence is online AND the URL responds.
+function effective(rec, presenceState) {
+  return rec && rec.url && rec.httpUp === false ? 'offline' : presenceState;
+}
+async function checkUrl(url) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), HTTP_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, { method: 'GET', signal: ctl.signal, redirect: 'follow' });
+    return res.status < 500;
+  } catch (_) {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 // Append a state change to the history log (seeds old records that have no log yet)
 function pushLog(rec, status, t) {
@@ -107,6 +131,10 @@ function calcUptime(rec, windowMs, now = Date.now()) {
 function fmtUptime(rec, windowMs) {
   const u = calcUptime(rec, windowMs);
   return u ? `${u.pct.toFixed(2)}%` : 'n/a';
+}
+function downtimeMs(rec, windowMs) {
+  const u = calcUptime(rec, windowMs);
+  return u ? Math.round(u.tracked * (1 - u.pct / 100)) : 0;
 }
 
 // Offline periods, newest first
@@ -221,10 +249,16 @@ async function buildNotice(botId, status, durationMs, now, kind) {
 }
 
 async function sendNotice(guild, cfg, botId, status, durationMs, now, opts = {}) {
-  const { kind = 'change', ping = true } = opts;
+  const { kind = 'change', ping = true, dm = true } = opts;
+  const embed = await buildNotice(botId, status, durationMs, now, kind);
+  if (dm && cfg.dmUsers && cfg.dmUsers.length) {
+    const dmEmbed = EmbedBuilder.from(embed).setFooter({ text: guild.name });
+    for (const uid of cfg.dmUsers) {
+      client.users.fetch(uid).then((u) => u.send({ embeds: [dmEmbed] })).catch(() => {});
+    }
+  }
   const channel = cfg.channelId && (await guild.channels.fetch(cfg.channelId).catch(() => null));
   if (!channel || !channel.isTextBased()) return false;
-  const embed = await buildNotice(botId, status, durationMs, now, kind);
   const doPing = ping && status === 'offline' && cfg.roleId;
   await channel
     .send({
@@ -282,7 +316,65 @@ async function syncGuild(guild) {
   try { await guild.members.fetch({ user: ids, withPresences: true }); } catch (_) { /* ignore */ }
   for (const id of ids) {
     const member = guild.members.cache.get(id);
-    report(guild, id, member ? toState(member.presence) : 'offline');
+    report(guild, id, effective(cfg.bots[id], member ? toState(member.presence) : 'offline'));
+  }
+}
+
+// Daily uptime summary, posted once at the configured hour
+async function checkDailyReport(guild) {
+  const cfg = db.guilds[guild.id];
+  if (!cfg || cfg.reportHour === null || cfg.reportHour === undefined) return;
+  const local = new Date(Date.now() + REPORT_TZ_OFFSET * 3600000);
+  const dayKey = local.toISOString().slice(0, 10);
+  if (local.getUTCHours() !== cfg.reportHour || cfg.lastReportDay === dayKey) return;
+  const ids = Object.keys(cfg.bots);
+  if (!ids.length) return;
+  cfg.lastReportDay = dayKey;
+  save();
+  const channel = cfg.channelId && (await guild.channels.fetch(cfg.channelId).catch(() => null));
+  if (!channel || !channel.isTextBased()) return;
+  const now = Date.now();
+  const lines = ids.map((id) => {
+    const r = cfg.bots[id];
+    const inc = incidents(r).filter((x) => x.start >= now - 86400000).length;
+    return `${icon(r.status)} <@${id}>\n└ uptime **${fmtUptime(r, 86400000)}** • incidents **${inc}** • downtime **${fmtDuration(downtimeMs(r, 86400000))}**`;
+  });
+  const embed = new EmbedBuilder()
+    .setColor(0x5865f2)
+    .setTitle('Daily uptime report')
+    .setDescription(lines.join('\n\n'))
+    .setFooter({ text: 'Last 24 hours' })
+    .setTimestamp(now);
+  await channel.send({ embeds: [embed] }).catch((e) => console.error('Could not send report:', e.message));
+}
+
+// Periodic sweep: HTTP checks, state re-check, reminders, daily report
+let sweeping = false;
+async function sweep() {
+  if (sweeping) return;
+  sweeping = true;
+  try {
+    for (const guild of client.guilds.cache.values()) {
+      const cfg = db.guilds[guild.id];
+      if (!cfg) continue;
+      try {
+        await Promise.all(
+          Object.values(cfg.bots)
+            .filter((rec) => rec.url)
+            .map((rec) => checkUrl(rec.url).then((up) => { rec.httpUp = up; })),
+        );
+        for (const id of Object.keys(cfg.bots)) {
+          const member = guild.members.cache.get(id);
+          report(guild, id, effective(cfg.bots[id], member ? toState(member.presence) : 'offline'));
+        }
+        await checkReminders(guild);
+        await checkDailyReport(guild);
+      } catch (e) {
+        console.error('sweep error:', e.message);
+      }
+    }
+  } finally {
+    sweeping = false;
   }
 }
 
@@ -290,7 +382,7 @@ client.on(Events.PresenceUpdate, (oldP, newP) => {
   if (!newP || !newP.guild) return;
   const cfg = db.guilds[newP.guild.id];
   if (!cfg || !cfg.bots[newP.userId]) return;
-  report(newP.guild, newP.userId, toState(newP));
+  report(newP.guild, newP.userId, effective(cfg.bots[newP.userId], toState(newP)));
 });
 
 // ---------- Slash command definitions ----------
@@ -322,6 +414,14 @@ const commands = [
     .addSubcommand((s) =>
       s.setName('reminder').setDescription('Repeat the alert while a bot stays offline')
         .addIntegerOption((o) => o.setName('minutes').setDescription('Interval in minutes (5-1440, 0 = off)').setMinValue(0).setMaxValue(1440)))
+    .addSubcommand((s) => s.setName('dm').setDescription('Toggle DM alerts for yourself'))
+    .addSubcommand((s) =>
+      s.setName('url').setDescription('Add an HTTP health check URL for a bot (leave URL empty to clear)')
+        .addUserOption(botOpt('Bot to check'))
+        .addStringOption((o) => o.setName('url').setDescription('http(s) URL to check').setMaxLength(300)))
+    .addSubcommand((s) =>
+      s.setName('report').setDescription('Daily uptime report at a given hour')
+        .addIntegerOption((o) => o.setName('hour').setDescription('Hour 0-23 (report time zone), -1 = off').setMinValue(-1).setMaxValue(23)))
     .addSubcommand((s) =>
       s.setName('prefix').setDescription('Show or change the prefix for chat commands')
         .addStringOption((o) => o.setName('prefix').setDescription('New prefix (1-5 characters)').setMaxLength(5)))
@@ -343,6 +443,9 @@ const ALIASES = {
   pause: 'pause', resume: 'resume',
   reminder: 'reminder', remind: 'reminder',
   prefix: 'prefix',
+  dm: 'dm',
+  url: 'url', health: 'url',
+  report: 'report', daily: 'report',
   test: 'test',
   ping: 'ping',
   help: 'help', h: 'help',
@@ -362,6 +465,9 @@ function helpEmbed(guildId) {
         `\`${p}role @role\` — role to ping on offline (no arg = clear)`,
         `\`${p}reminder <minutes>\` — repeat alert while offline (0 = off)`,
         `\`${p}prefix <new>\` — change the chat prefix`,
+        `\`${p}dm\` — toggle DM alerts for yourself`,
+        `\`${p}url @bot <url>\` — HTTP health check (no url = clear)`,
+        `\`${p}report <hour|off>\` — daily uptime report`,
       ].join('\n') },
       { name: 'Info', value: [
         `\`${p}list\` — status of all bots`,
@@ -423,6 +529,62 @@ async function run(ctx) {
       return ctx.reply(n ? `✅ Offline bots will be re-announced every **${n} min**.` : '✅ Reminders turned off.');
     }
 
+    if (sub === 'dm') {
+      const uid = ctx.userId;
+      const idx = cfg.dmUsers.indexOf(uid);
+      if (idx >= 0) {
+        cfg.dmUsers.splice(idx, 1);
+        save();
+        return ctx.reply('🔕 DM alerts turned off for you.');
+      }
+      if (cfg.dmUsers.length >= MAX_DM_USERS) return ctx.reply(`❌ Limit reached (${MAX_DM_USERS} people per server).`);
+      const u = await client.users.fetch(uid).catch(() => null);
+      const sent = u && (await u.send(`🔔 DM alerts are on for **${guild.name}**. Use the dm command again to turn them off.`).then(() => true).catch(() => false));
+      if (!sent) return ctx.reply('❌ I could not DM you. Allow DMs from server members, then try again.');
+      cfg.dmUsers.push(uid);
+      save();
+      return ctx.reply('🔔 DM alerts turned on. Check your DMs.');
+    }
+
+    if (sub === 'url') {
+      const user = await needBot();
+      if (!user) return;
+      const rec = cfg.bots[user.id];
+      if (!rec) return ctx.reply('ℹ️ That bot is not monitored.');
+      const url = await ctx.getUrl();
+      if (!url) {
+        delete rec.url;
+        delete rec.httpUp;
+        save();
+        return ctx.reply(`✅ Health check cleared for <@${user.id}>.`);
+      }
+      if (!/^https?:\/\/\S+$/i.test(url)) return ctx.reply('❌ Use a full URL starting with http:// or https://');
+      await ctx.defer();
+      const up = await checkUrl(url);
+      rec.url = url;
+      rec.httpUp = up;
+      save();
+      const member = guild.members.cache.get(user.id);
+      report(guild, user.id, effective(rec, member ? toState(member.presence) : 'offline'));
+      return ctx.reply(`✅ Health check set for <@${user.id}>. The URL is currently ${up ? '🟢 up' : '🔴 down'}.\nThe bot counts as online only when its presence is online **and** the URL responds.`);
+    }
+
+    if (sub === 'report') {
+      const h = await ctx.getNumber();
+      const tz = `UTC${REPORT_TZ_OFFSET >= 0 ? '+' : ''}${REPORT_TZ_OFFSET}`;
+      if (h === null || h === undefined || Number.isNaN(h)) {
+        return ctx.reply(cfg.reportHour === null
+          ? 'ℹ️ Daily report is **off**. Set an hour (0-23) to turn it on.'
+          : `ℹ️ Daily report is posted at **${String(cfg.reportHour).padStart(2, '0')}:00** (${tz}).`);
+      }
+      if (h < -1 || h > 23) return ctx.reply('❌ Use an hour from 0 to 23, or off.');
+      cfg.reportHour = h < 0 ? null : h;
+      save();
+      return ctx.reply(h < 0
+        ? '✅ Daily report turned off.'
+        : `✅ Daily uptime report will be posted at **${String(h).padStart(2, '0')}:00** (${tz}) in the alert channel.`);
+    }
+
     if (sub === 'prefix') {
       const val = await ctx.getText();
       if (!val) return ctx.reply(`ℹ️ Current prefix: \`${prefixOf(ctx.guildId)}\``);
@@ -477,7 +639,7 @@ async function run(ctx) {
       const now = Date.now();
       const lines = ids.map((id) => {
         const r = cfg.bots[id];
-        const flag = r.paused ? ' ⏸️ paused' : '';
+        const flag = (r.paused ? ' ⏸️ paused' : '') + (r.url ? (r.httpUp === false ? ' 🌐❌' : ' 🌐✅') : '');
         return `${icon(r.status)} <@${id}> — ${r.status} for ${fmtDuration(now - (r.since || now))}${flag}`;
       });
       const embed = new EmbedBuilder()
@@ -561,7 +723,7 @@ async function run(ctx) {
 
     if (sub === 'test') {
       if (!cfg.channelId) return ctx.reply(`❌ Set an alert channel first with \`${prefixOf(ctx.guildId)}channel\`.`);
-      const ok = await sendNotice(guild, cfg, client.user.id, 'offline', 3600000, Date.now(), { ping: false });
+      const ok = await sendNotice(guild, cfg, client.user.id, 'offline', 3600000, Date.now(), { ping: false, dm: false });
       return ctx.reply(ok ? '✅ Test alert sent (it uses this bot as the sample, no role ping).' : '❌ I cannot access the alert channel.');
     }
   } catch (e) {
@@ -580,6 +742,7 @@ client.on(Events.InteractionCreate, async (i) => {
     guildId: i.guildId,
     channel: i.channel,
     sub: i.options.getSubcommand(),
+    userId: i.user.id,
     reply: (p) => (i.deferred || i.replied
       ? i.editReply(toPayload(p))
       : i.reply({ ...toPayload(p), ephemeral: true })),
@@ -587,7 +750,11 @@ client.on(Events.InteractionCreate, async (i) => {
     getBot: async () => i.options.getUser('bot'),
     getChannel: async () => i.options.getChannel('channel'),
     getRole: async () => i.options.getRole('role'),
-    getNumber: async () => i.options.getInteger('minutes'),
+    getNumber: async () => {
+      const v = i.options.getInteger('minutes');
+      return v !== null ? v : i.options.getInteger('hour');
+    },
+    getUrl: async () => i.options.getString('url'),
     getText: async () => i.options.getString('prefix'),
   };
   await run(ctx);
@@ -626,6 +793,7 @@ client.on(Events.MessageCreate, async (msg) => {
     guildId: msg.guild.id,
     channel: msg.channel,
     sub,
+    userId: msg.author.id,
     reply: (p) => msg.reply({ ...toPayload(p), allowedMentions: { parse: [], repliedUser: false } }),
     defer: async () => { await msg.channel.sendTyping().catch(() => {}); },
     getBot: async () => {
@@ -640,7 +808,8 @@ client.on(Events.MessageCreate, async (msg) => {
       const id = idFrom(args[0]);
       return id ? msg.guild.roles.cache.get(id) || null : null;
     },
-    getNumber: async () => (args[0] === undefined ? null : parseInt(args[0], 10)),
+    getNumber: async () => (args[0] === undefined ? null : /^off$/i.test(args[0]) ? -1 : parseInt(args[0], 10)),
+    getUrl: async () => args[1] || null,
     getText: async () => args[0] || null,
   };
   await run(ctx);
@@ -662,17 +831,7 @@ client.once(Events.ClientReady, async () => {
     await syncGuild(guild);
     updatePanel(guild);
   }
-  setInterval(() => {
-    for (const guild of client.guilds.cache.values()) {
-      const cfg = db.guilds[guild.id];
-      if (!cfg) continue;
-      for (const id of Object.keys(cfg.bots)) {
-        const member = guild.members.cache.get(id);
-        report(guild, id, member ? toState(member.presence) : 'offline');
-      }
-      checkReminders(guild).catch((e) => console.error('reminder error:', e.message));
-    }
-  }, SWEEP_MS);
+  setInterval(() => { sweep().catch((e) => console.error('sweep error:', e.message)); }, SWEEP_MS);
   setInterval(() => {
     for (const guild of client.guilds.cache.values()) updatePanel(guild);
   }, PANEL_MS);
